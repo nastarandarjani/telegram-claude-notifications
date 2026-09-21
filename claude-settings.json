@@ -12,6 +12,30 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "input=$(cat); reason=$(jq -r '.reason // \"other\"' <<<\"$input\"); cwd=$(jq -r '.cwd // empty' <<<\"$input\"); vscode_active() { pgrep -u \"$USER\" -f 'vscode-server/extensions/anthropic\\.claude-code-.*resources/native-binary/claude' >/dev/null 2>&1; }; in_claude_tmux() { [ -n \"$TMUX\" ] && [ \"$(tmux display-message -p '#S' 2>/dev/null)\" = \"claude\" ]; }; if [ -n \"$cwd\" ] && [ \"$reason\" != \"clear\" ] && [ \"$reason\" != \"resume\" ] && ! vscode_active && ! in_claude_tmux && ! tmux has-session -t claude 2>/dev/null; then tmux new-session -d -s claude -c \"$cwd\" \"claude continue\"; fi",
+            "async": true,
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "vscode_active() { pgrep -u \"$USER\" -f 'vscode-server/extensions/anthropic\\.claude-code-.*resources/native-binary/claude' >/dev/null 2>&1; }; in_claude_tmux() { [ -n \"$TMUX\" ] && [ \"$(tmux display-message -p '#S' 2>/dev/null)\" = \"claude\" ]; }; if vscode_active && ! in_claude_tmux; then tmux kill-session -t claude 2>/dev/null; fi",
+            "async": true,
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }
