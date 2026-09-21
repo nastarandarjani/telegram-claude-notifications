@@ -81,7 +81,7 @@ closes — as opposed to `Stop`, which fires after every single turn).
 "SessionEnd": [{
   "hooks": [{
     "type": "command",
-    "command": "input=$(cat); reason=$(jq -r '.reason // \"other\"' <<<\"$input\"); cwd=$(jq -r '.cwd // empty' <<<\"$input\"); vscode_active() { pgrep -u \"$USER\" -f 'vscode-server/extensions/anthropic\\.claude-code-.*resources/native-binary/claude' >/dev/null 2>&1; }; in_claude_tmux() { [ -n \"$TMUX\" ] && [ \"$(tmux display-message -p '#S' 2>/dev/null)\" = \"claude\" ]; }; if [ -n \"$cwd\" ] && [ \"$reason\" != \"clear\" ] && [ \"$reason\" != \"resume\" ] && ! vscode_active && ! in_claude_tmux && ! tmux has-session -t claude 2>/dev/null; then tmux new-session -d -s claude -c \"$cwd\" \"claude continue\"; fi",
+    "command": "input=$(cat); reason=$(jq -r '.reason // \"other\"' <<<\"$input\"); cwd=$(jq -r '.cwd // empty' <<<\"$input\"); vscode_active() { pgrep -u \"$USER\" -f 'vscode-server/extensions/anthropic\\.claude-code-.*resources/native-binary/claude' >/dev/null 2>&1; }; in_claude_tmux() { [ -n \"$TMUX\" ] && [ \"$(tmux display-message -p '#S' 2>/dev/null)\" = \"claude\" ]; }; if [ -n \"$cwd\" ] && [ \"$reason\" != \"clear\" ] && [ \"$reason\" != \"resume\" ] && ! vscode_active && ! in_claude_tmux && ! tmux has-session -t claude 2>/dev/null; then tmux new-session -d -s claude -c \"$cwd\" \"bash -lc 'claude continue'\" \\; set-option -t claude remain-on-exit on; echo \"$(date -Is) SessionEnd: spawned claude tmux session (cwd=$cwd reason=$reason)\" >> ~/.claude_hook.log; fi",
     "async": true,
     "timeout": 15
   }]
@@ -113,6 +113,29 @@ group confirmed gone via `ps`, the tmux session confirmed still listed.
 tmux's server double-forks/detaches into its own session on creation,
 which is specifically what makes this survive where a plain backgrounded
 command would not.
+
+**`bash -lc 'claude continue'` instead of a bare `claude continue`**: found
+the hard way — `claude` is a user-local install (`~/.local/bin/claude`),
+which is only on `PATH` once `~/.bashrc` has been sourced. tmux runs a
+`new-session` command via the default shell *non-interactively and
+non-login*, so it does **not** source `~/.bashrc`, so `claude` was not
+found. That failure was silent and fast: the pane's only command exited
+immediately with "command not found," and since it was the session's only
+pane, the whole tmux session died within a second or two — before
+`tmux ls` from anywhere would ever show it, and before it could reach the
+point of resuming (so no Telegram notification either). Confirmed directly
+by reproducing it: spawning the old command under a `PATH` stripped down
+to just `/usr/bin`, the session vanished near-instantly; the same
+reproduction with `bash -lc '...'` left a real, running `claude` process in
+the pane. `bash -lc` forces a login shell, which sources the rc files and
+fixes `PATH` regardless of what environment the hook itself inherited.
+`set-option -t claude remain-on-exit on` is a second line of defense: if
+`claude continue` ever exits for some *other* reason (crash, bad
+`--continue` state, etc.), the pane stays around showing the error instead
+of the whole session disappearing with no trace. The trailing `echo ... >>
+~/.claude_hook.log` records every spawn attempt (timestamp, cwd, reason)
+so a future failure has a paper trail instead of requiring a fresh
+from-scratch investigation.
 
 ### 4. Kill-on-open hook — `~/.claude/settings.json`
 
@@ -172,4 +195,6 @@ session leaves it alone.
 - Check VSCode detection: `pgrep -u "$USER" -f 'vscode-server/extensions/anthropic\.claude-code-.*resources/native-binary/claude'`.
 - Check the auto-continue session: `tmux list-sessions | grep claude`, `tmux attach -t claude` to look inside without disturbing anything already running (detach with `Ctrl-b d` when done, not `exit`).
 - If a `claude` session keeps vanishing right after you expect it to start, check whether `SessionStart`'s kill-on-open hook is the cause (it's unconditional whenever `vscode_active` is true).
+- Check `~/.claude_hook.log` for a record of every SessionEnd spawn attempt (timestamp, cwd, reason). If a session vanished with no entry logged, the SessionEnd hook likely never fired at all (e.g. `reason` was `clear`/`resume`, or you're checking `tmux ls` on a different login node than the one the hook actually ran on — the tmux server socket is node-local, unlike `~/.claude_watching`).
+- If a spawned session is present but shows a dead pane (`remain-on-exit` kept it around), `tmux attach -t claude` to read the error directly.
 - Bot token / chat ID live only in `~/.claude/settings.json` — rotate there if the bot token ever leaks.
