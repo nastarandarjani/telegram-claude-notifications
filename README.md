@@ -81,7 +81,7 @@ closes — as opposed to `Stop`, which fires after every single turn).
 "SessionEnd": [{
   "hooks": [{
     "type": "command",
-    "command": "input=$(cat); reason=$(jq -r '.reason // \"other\"' <<<\"$input\"); cwd=$(jq -r '.cwd // empty' <<<\"$input\"); vscode_active() { pgrep -u \"$USER\" -f 'vscode-server/extensions/anthropic\\.claude-code-.*resources/native-binary/claude' >/dev/null 2>&1; }; in_claude_tmux() { [ -n \"$TMUX\" ] && [ \"$(tmux display-message -p '#S' 2>/dev/null)\" = \"claude\" ]; }; if [ -n \"$cwd\" ] && [ \"$reason\" != \"clear\" ] && [ \"$reason\" != \"resume\" ] && ! vscode_active && ! in_claude_tmux && ! tmux has-session -t claude 2>/dev/null; then tmux new-session -d -s claude -c \"$cwd\" \"bash -lc 'claude --continue'\" \\; set-option -t claude remain-on-exit on; echo \"$(date -Is) SessionEnd: spawned claude tmux session (cwd=$cwd reason=$reason)\" >> ~/.claude_hook.log; fi",
+    "command": "input=$(cat); reason=$(jq -r '.reason // \"other\"' <<<\"$input\"); cwd=$(jq -r '.cwd // empty' <<<\"$input\"); vscode_active() { pgrep -u \"$USER\" -f 'vscode-server/extensions/anthropic\\.claude-code-.*resources/native-binary/claude' >/dev/null 2>&1; }; in_claude_tmux() { [ -n \"$TMUX\" ] && [ \"$(tmux display-message -p '#S' 2>/dev/null)\" = \"claude\" ]; }; va=no; vscode_active && va=yes; ict=no; in_claude_tmux && ict=yes; ex=no; tmux has-session -t claude 2>/dev/null && ex=yes; echo \"$(date -Is) SessionEnd fired: reason=$reason cwd=$cwd vscode_active=$va in_claude_tmux=$ict existing=$ex\" >> ~/.claude_hook.log; if [ -n \"$cwd\" ] && [ \"$reason\" != \"clear\" ] && [ \"$reason\" != \"resume\" ] && [ \"$va\" = no ] && [ \"$ict\" = no ] && [ \"$ex\" = no ]; then tmux new-session -d -s claude -c \"$cwd\" \"bash -lc 'claude --continue'\" \\; set-option -t claude remain-on-exit on; echo \"$(date -Is) SessionEnd: spawned claude tmux session (cwd=$cwd)\" >> ~/.claude_hook.log; fi",
     "async": true,
     "timeout": 15
   }]
@@ -89,8 +89,13 @@ closes — as opposed to `Stop`, which fires after every single turn).
 ```
 
 Reads `cwd` (the ending session's working directory) and `reason` from the
-hook's JSON stdin, then spawns the tmux session there only if **all** of
-these hold:
+hook's JSON stdin, unconditionally logs a `SessionEnd fired:` line to
+`~/.claude_hook.log` recording `reason`/`cwd` and all three guard values
+(`vscode_active`/`in_claude_tmux`/`existing`) — this runs on *every*
+SessionEnd, not just ones that go on to spawn, specifically so a "nothing
+happened and I don't know why" report has a paper trail instead of
+requiring blind re-diagnosis — then spawns the tmux session there only if
+**all** of these hold:
 - `reason` isn't `clear` or `resume` (those mean the session is continuing
   in some form, not actually closing — `logout`/`prompt_input_exit`/`other`
   are treated as a real close).
@@ -195,6 +200,7 @@ session leaves it alone.
 - Check VSCode detection: `pgrep -u "$USER" -f 'vscode-server/extensions/anthropic\.claude-code-.*resources/native-binary/claude'`.
 - Check the auto-continue session: `tmux list-sessions | grep claude`, `tmux attach -t claude` to look inside without disturbing anything already running (detach with `Ctrl-b d` when done, not `exit`).
 - If a `claude` session keeps vanishing right after you expect it to start, check whether `SessionStart`'s kill-on-open hook is the cause (it's unconditional whenever `vscode_active` is true).
-- Check `~/.claude_hook.log` for a record of every SessionEnd spawn attempt (timestamp, cwd, reason). If a session vanished with no entry logged, the SessionEnd hook likely never fired at all (e.g. `reason` was `clear`/`resume`, or you're checking `tmux ls` on a different login node than the one the hook actually ran on — the tmux server socket is node-local, unlike `~/.claude_watching`).
+- Check `~/.claude_hook.log`: every SessionEnd fire logs a `SessionEnd fired: reason=... cwd=... vscode_active=... in_claude_tmux=... existing=...` line unconditionally, plus a second `spawned` line if it actually spawned. If there's **no `fired` line at all** for a close you expected to trigger it, the hook never ran — check whether you're looking at `tmux ls` on a different login node than the one the hook ran on (the tmux socket is node-local, unlike `~/.claude_watching` or this log file, both under `$HOME`), or whether VSCode's close path for this session didn't invoke `SessionEnd` at all (e.g. the extension host was killed abruptly rather than shutting down gracefully). If there **is** a `fired` line but no `spawned` line, one of `vscode_active`/`in_claude_tmux`/`existing` was unexpectedly `yes` — a `vscode_active=yes` right after closing is the most likely case: the extension's native binary process can take a moment to fully exit, so `SessionEnd` firing and the process table catching up aren't perfectly synchronized.
 - If a spawned session is present but shows a dead pane (`remain-on-exit` kept it around), `tmux attach -t claude` to read the error directly.
+- Ruled out (tested directly, not assumed): a detached tmux session surviving after its spawning context ends does **not** require `loginctl enable-linger` on this cluster — reproduced both a raw `SIGKILL` to the whole spawning process group and a full systemd user-scope teardown (`systemd-run --user --scope`), and the tmux session survived both, consistent with `KillUserProcesses` being off (`loginctl show-user $USER --property=Linger` showing `no` didn't matter in either reproduction). If a session still vanishes with no explanation from the checks above, it's more likely the race condition described above than a linger/systemd cleanup issue.
 - Bot token / chat ID live only in `~/.claude/settings.json` — rotate there if the bot token ever leaks.
