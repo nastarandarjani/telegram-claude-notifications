@@ -7,7 +7,7 @@ Two things, wired together:
    the VSCode extension).
 2. When you close VSCode (specifically, when the Claude Code extension's own
    session ends), automatically spins up a detached tmux session named
-   `claude` in the same directory and resumes with `claude continue` — so
+   `claude` in the same directory and resumes with `claude --continue` — so
    work keeps going unattended, and you get pinged on Telegram once it's
    done, per (1). When you open VSCode again, that tmux session gets killed
    unconditionally — see (4) for why.
@@ -81,7 +81,7 @@ closes — as opposed to `Stop`, which fires after every single turn).
 "SessionEnd": [{
   "hooks": [{
     "type": "command",
-    "command": "input=$(cat); reason=$(jq -r '.reason // \"other\"' <<<\"$input\"); cwd=$(jq -r '.cwd // empty' <<<\"$input\"); vscode_active() { pgrep -u \"$USER\" -f 'vscode-server/extensions/anthropic\\.claude-code-.*resources/native-binary/claude' >/dev/null 2>&1; }; in_claude_tmux() { [ -n \"$TMUX\" ] && [ \"$(tmux display-message -p '#S' 2>/dev/null)\" = \"claude\" ]; }; if [ -n \"$cwd\" ] && [ \"$reason\" != \"clear\" ] && [ \"$reason\" != \"resume\" ] && ! vscode_active && ! in_claude_tmux && ! tmux has-session -t claude 2>/dev/null; then tmux new-session -d -s claude -c \"$cwd\" \"bash -lc 'claude continue'\" \\; set-option -t claude remain-on-exit on; echo \"$(date -Is) SessionEnd: spawned claude tmux session (cwd=$cwd reason=$reason)\" >> ~/.claude_hook.log; fi",
+    "command": "input=$(cat); reason=$(jq -r '.reason // \"other\"' <<<\"$input\"); cwd=$(jq -r '.cwd // empty' <<<\"$input\"); vscode_active() { pgrep -u \"$USER\" -f 'vscode-server/extensions/anthropic\\.claude-code-.*resources/native-binary/claude' >/dev/null 2>&1; }; in_claude_tmux() { [ -n \"$TMUX\" ] && [ \"$(tmux display-message -p '#S' 2>/dev/null)\" = \"claude\" ]; }; if [ -n \"$cwd\" ] && [ \"$reason\" != \"clear\" ] && [ \"$reason\" != \"resume\" ] && ! vscode_active && ! in_claude_tmux && ! tmux has-session -t claude 2>/dev/null; then tmux new-session -d -s claude -c \"$cwd\" \"bash -lc 'claude --continue'\" \\; set-option -t claude remain-on-exit on; echo \"$(date -Is) SessionEnd: spawned claude tmux session (cwd=$cwd reason=$reason)\" >> ~/.claude_hook.log; fi",
     "async": true,
     "timeout": 15
   }]
@@ -114,7 +114,7 @@ tmux's server double-forks/detaches into its own session on creation,
 which is specifically what makes this survive where a plain backgrounded
 command would not.
 
-**`bash -lc 'claude continue'` instead of a bare `claude continue`**: found
+**`bash -lc 'claude --continue'` instead of a bare `claude --continue`**: found
 the hard way — `claude` is a user-local install (`~/.local/bin/claude`),
 which is only on `PATH` once `~/.bashrc` has been sourced. tmux runs a
 `new-session` command via the default shell *non-interactively and
@@ -130,8 +130,8 @@ reproduction with `bash -lc '...'` left a real, running `claude` process in
 the pane. `bash -lc` forces a login shell, which sources the rc files and
 fixes `PATH` regardless of what environment the hook itself inherited.
 `set-option -t claude remain-on-exit on` is a second line of defense: if
-`claude continue` ever exits for some *other* reason (crash, bad
-`--continue` state, etc.), the pane stays around showing the error instead
+`claude --continue` ever exits for some *other* reason (crash, bad
+resume state, etc.), the pane stays around showing the error instead
 of the whole session disappearing with no trace. The trailing `echo ... >>
 ~/.claude_hook.log` records every spawn attempt (timestamp, cwd, reason)
 so a future failure has a paper trail instead of requiring a fresh
@@ -165,7 +165,7 @@ the latest conversation state, at the cost of losing any in-progress
 background work if you happen to reopen VSCode while it's still running.
 
 `in_claude_tmux` guards against a real self-destruction loop: spawning
-`claude continue` in tmux is itself a new session starting, which would
+`claude --continue` in tmux is itself a new session starting, which would
 otherwise immediately trigger this same hook and kill the session it just
 created. Tested directly (not just reasoned about): the guard correctly
 lets an external SessionStart (e.g. VSCode opening) kill an existing
