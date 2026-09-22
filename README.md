@@ -92,9 +92,9 @@ closes — as opposed to `Stop`, which fires after every single turn).
 "SessionEnd": [{
   "hooks": [{
     "type": "command",
-    "command": "input=$(cat); reason=$(jq -r '.reason // \"other\"' <<<\"$input\"); cwd=$(jq -r '.cwd // empty' <<<\"$input\"); sid=$(jq -r '.session_id // empty' <<<\"$input\"); echo \"$input\" >> ~/.claude_hook_raw.jsonl; vscode_active() { pgrep -u \"$USER\" -f 'vscode-server/extensions/anthropic\\.claude-code-.*resources/native-binary/claude' >/dev/null 2>&1; }; in_claude_tmux() { [ -n \"$CLAUDE_AUTOCONTINUE\" ]; }; va=no; vscode_active && va=yes; ict=no; in_claude_tmux && ict=yes; ex=no; tmux has-session -t claude 2>/dev/null && ex=yes; would_spawn=no; [ -n \"$cwd\" ] && [ \"$reason\" != \"clear\" ] && [ \"$reason\" != \"resume\" ] && [ \"$ict\" = no ] && [ \"$ex\" = no ] && would_spawn=yes; alive=no; if [ \"$would_spawn\" = yes ] && [ -n \"$sid\" ]; then sleep 3; pgrep -u \"$USER\" -f \"resume=$sid\" >/dev/null 2>&1 && alive=yes; fi; echo \"$(date -Is) SessionEnd fired: reason=$reason cwd=$cwd sid=$sid vscode_active=$va in_claude_tmux=$ict existing=$ex would_spawn=$would_spawn alive_after_wait=$alive\" >> ~/.claude_hook.log; if [ \"$would_spawn\" = yes ] && [ \"$alive\" = no ]; then if [ -n \"$sid\" ]; then rc=\"claude --resume=$sid\"; else rc=\"claude --continue\"; fi; tmux new-session -d -s claude -c \"$cwd\" -e CLAUDE_AUTOCONTINUE=1 \"bash -lc '$rc'\" \\; set-option -t claude remain-on-exit on; echo \"$(date -Is) SessionEnd: spawned claude tmux session (cwd=$cwd sid=$sid)\" >> ~/.claude_hook.log; fi",
+    "command": "input=$(cat); reason=$(jq -r '.reason // \"other\"' <<<\"$input\"); cwd=$(jq -r '.cwd // empty' <<<\"$input\"); sid=$(jq -r '.session_id // empty' <<<\"$input\"); echo \"$input\" >> ~/.claude_hook_raw.jsonl; vscode_active() { pgrep -u \"$USER\" -f 'vscode-server/extensions/anthropic\\.claude-code-.*resources/native-binary/claude' >/dev/null 2>&1; }; in_claude_tmux() { [ -n \"$CLAUDE_AUTOCONTINUE\" ]; }; va=no; vscode_active && va=yes; ict=no; in_claude_tmux && ict=yes; ex=no; tmux has-session -t claude 2>/dev/null && ex=yes; would_spawn=no; [ -n \"$cwd\" ] && [ \"$reason\" != \"clear\" ] && [ \"$reason\" != \"resume\" ] && [ \"$ict\" = no ] && [ \"$ex\" = no ] && would_spawn=yes; alive=no; if [ \"$would_spawn\" = yes ] && [ -n \"$sid\" ]; then for i in 1 2 3 4 5; do sleep 2; if pgrep -u \"$USER\" -f \"resume=$sid\" >/dev/null 2>&1; then alive=yes; break; fi; done; fi; echo \"$(date -Is) SessionEnd fired: reason=$reason cwd=$cwd sid=$sid vscode_active=$va in_claude_tmux=$ict existing=$ex would_spawn=$would_spawn alive_after_wait=$alive\" >> ~/.claude_hook.log; if [ \"$would_spawn\" = yes ] && [ \"$alive\" = no ]; then if [ -n \"$sid\" ]; then rc=\"claude --resume=$sid\"; else rc=\"claude --continue\"; fi; tmux new-session -d -s claude -c \"$cwd\" -e CLAUDE_AUTOCONTINUE=1 \"bash -lc '$rc'\" \\; set-option -t claude remain-on-exit on; echo \"$(date -Is) SessionEnd: spawned claude tmux session (cwd=$cwd sid=$sid)\" >> ~/.claude_hook.log; fi",
     "async": true,
-    "timeout": 15
+    "timeout": 25
   }]
 }]
 ```
@@ -118,19 +118,33 @@ re-diagnosis. `would_spawn` is computed from all of these holding:
   duplicate spawns if SessionEnd fires more than once in quick succession.
 
 **Liveness check, the actual mitigation for the "Known issue" below**: even
-when `would_spawn` is `yes`, the hook waits 3 seconds and then checks
-`pgrep -u "$USER" -f "resume=$sid"` — VSCode's own process always carries
-`--resume=<session_id>` when resuming a session, so if a process matching
-that exact session is still alive after the wait, `alive_after_wait=yes`
-and the spawn is skipped, logged, but not acted on. Only spawns when
-`would_spawn=yes` **and** `alive_after_wait=no`. This doesn't depend on
-understanding *why* `SessionEnd` might fire on a still-live session (see
-"Known issue" below) — it just refuses to act on a close claim that's
-contradicted by the process table, which is the actual harm this hook
-could otherwise cause. Tested directly: a fake process holding
-`--resume=<id>` in its argv correctly blocks the spawn (confirmed no tmux
-session or socket is even created); with no such process, it spawns
-normally.
+when `would_spawn` is `yes`, the hook retries `pgrep -u "$USER" -f
+"resume=$sid"` up to 5 times, sleeping 2 seconds between each try (so up
+to 10 seconds total, stopping early on the first hit) — VSCode's own
+process always carries `--resume=<session_id>` when resuming a session,
+so if a process matching that exact session becomes alive at any point
+during the retry window, `alive_after_wait=yes` and the spawn is skipped,
+logged, but not acted on. Only spawns when `would_spawn=yes` **and**
+`alive_after_wait=no` after the full window elapses. This doesn't depend
+on understanding *why* `SessionEnd` might fire on a still-live session
+(see "Known issue" below) — it just refuses to act on a close claim
+that's contradicted by the process table, which is the actual harm this
+hook could otherwise cause. `timeout` is 25s to comfortably cover the
+worst case (10s of retries plus `jq`/`pgrep` overhead).
+
+**Why retry instead of a single check after a fixed wait**: an earlier
+single-check version (wait 3s, check once) was caught missing a real
+case during a live VSCode reconnect — the *new* VSCode-side process
+carrying `--resume=<id>` didn't finish starting until ~4 seconds after
+the triggering event, one second after the single check had already run
+and concluded "not alive," so it spawned a duplicate (only cleaned up by
+a lucky second `SessionStart` kill-on-open firing moments later — not
+guaranteed by the design). Retested with the retry loop using a properly
+isolated fake process that only appears 6 seconds in (mimicking that
+delay, with margin): correctly detected as alive partway through the
+retry window and skipped the spawn. A second test with a process that
+never appears confirmed it still spawns normally after exhausting all 5
+tries (~10s).
 
 **`in_claude_tmux` no longer queries tmux live** — it used to be
 `[ -n "$TMUX" ] && [ "$(tmux display-message -p '#S')" = claude ]`, which
@@ -340,15 +354,17 @@ unlike the earlier invalid hour-long check, but it's still a small sample
 fixed short cadence" isn't ruled out by it. Considered sufficient for now
 by the person doing the testing; not escalated further.
 
-**A separate, real bug found during the reconnect part of this retest**:
-the moment VSCode reconnected, kill-on-open killed the pre-existing
-tmux-hosted copy of this same session, whose own shutdown fired a
-genuine SessionEnd for this session's real id. The liveness check waited
-3 seconds and found no live `--resume=<id>` process yet — because the
-*new* VSCode-side process hadn't finished starting up in that window —
-and incorrectly spawned a duplicate. It was cleaned up only because
-kill-on-open happened to fire a second time moments later; nothing in
-the design guarantees that. The 3-second, single-check liveness window
-is therefore not reliable specifically around a reconnect and should be
-made more robust (e.g. retrying over a longer window) before being fully
-trusted.
+**A separate, real bug found during the reconnect part of this retest,
+since fixed**: the moment VSCode reconnected, kill-on-open killed the
+pre-existing tmux-hosted copy of this same session, whose own shutdown
+fired a genuine SessionEnd for this session's real id. The liveness
+check at the time waited 3 seconds and checked once, found no live
+`--resume=<id>` process yet — because the *new* VSCode-side process
+hadn't finished starting up in that window (confirmed via `ps -o
+lstart`: it started ~4 seconds after the triggering event, one second
+after the single check had already run) — and incorrectly spawned a
+duplicate. It was cleaned up only because kill-on-open happened to fire
+a second time moments later; nothing in the design guaranteed that. Fixed
+by replacing the single 3-second-wait check with a retry loop (see hook
+(3) above) and confirmed via isolated tests that it now catches a process
+appearing partway through the window instead of missing it.
