@@ -1,15 +1,17 @@
 # Telegram notifications + auto-continue in tmux
 
-**Note**: during development, a still-actively-used VSCode session was
-observed briefly firing `SessionEnd` events repeatedly despite nothing
-actually ending. The cause isn't confirmed — one contributing factor
-(manually killing the tmux session while debugging a separate race) is
-plausible for that specific burst, but whether it correlates with
-messaging through the VSCode extension specifically is still an open,
-untested question (a "zero fires for an hour" check turned out to be
-invalid — see "Known issue" near the end of this file for why). A
-liveness check (hook (3) below) makes the spawn safe either way, without
-needing this resolved.
+**Note**: during development, `SessionEnd` was repeatedly observed firing
+for sessions other than the one actually closing, including at least
+three times landing in the same second as a real close/reopen event —
+the cause is still not root-caused (see "Known issue" near the end of
+this file), but it's a real, recurring behavior, not a one-off. The auto-
+continue spawn is built to be correct and safe regardless: a liveness
+check (skips resuming a session that's still actually alive) and a
+`flock`-guarded critical section around the existing-check-and-spawn
+step (so two concurrent fires can't race for the same tmux session name
+and silently pick the wrong winner) — both confirmed via targeted tests
+and a full live close/reopen cycle that hit this exact race in the wild
+and handled it correctly.
 
 Two things, wired together:
 1. Sends a Telegram message whenever a Claude Code CLI turn ends, so you get
@@ -423,3 +425,28 @@ the background) could fail with the log actively claiming it succeeded.
 Combined with the still-unexplained extra session_ids, it's a reminder
 that "no spawned=no in the log" was never sufficient evidence that the
 feature worked, until this fix.
+
+**A full live close/reopen test with all fixes in place (retry-loop
+liveness check, lock, exit-code check) confirmed the fix directly, and
+sharpened the still-open mystery**: two more concurrent
+different-session_id pairs fired in the same second as real close/reopen
+events (`d3338bd2...` and `8c447d50...`, alongside this real session's own
+id both times) — the lock correctly let exactly one of each pair spawn
+and made the other back off honestly (`existing=yes, spawned=no`), with
+no silent duplication either way, including the case where the *real*
+session lost the race the first time and correctly got nothing, and won
+it the second time and correctly got a real background copy. Final state
+after both cycles: no leftover tmux session, exactly one live process
+(the real, VSCode-side one), no duplicates.
+
+This makes **three separate occasions** (`49f6ec47...` on an earlier
+reconnect, now these two) where an unexplained, different session_id
+fired `SessionEnd` at almost the exact same moment as a real close/reopen
+event. That's a much more specific pattern than "random every 20-70s" or
+"every message sent" — both considered and moved past earlier in this
+section — and points toward something in VSCode's own close/reopen
+mechanics specifically (a companion process, a telemetry/diagnostic
+session, some internal restart of its own) rather than a periodic
+background timer or per-message behavior. Still not root-caused, and not
+pursued further for now, but worth keeping in mind as the most
+specific lead if this is ever revisited.
