@@ -92,7 +92,7 @@ closes — as opposed to `Stop`, which fires after every single turn).
 "SessionEnd": [{
   "hooks": [{
     "type": "command",
-    "command": "input=$(cat); reason=$(jq -r '.reason // \"other\"' <<<\"$input\"); cwd=$(jq -r '.cwd // empty' <<<\"$input\"); sid=$(jq -r '.session_id // empty' <<<\"$input\"); echo \"$input\" >> ~/.claude_hook_raw.jsonl; vscode_active() { pgrep -u \"$USER\" -f 'vscode-server/extensions/anthropic\\.claude-code-.*resources/native-binary/claude' >/dev/null 2>&1; }; in_claude_tmux() { [ -n \"$CLAUDE_AUTOCONTINUE\" ]; }; va=no; vscode_active && va=yes; ict=no; in_claude_tmux && ict=yes; ex=no; tmux has-session -t claude 2>/dev/null && ex=yes; would_spawn=no; [ -n \"$cwd\" ] && [ \"$reason\" != \"clear\" ] && [ \"$reason\" != \"resume\" ] && [ \"$ict\" = no ] && [ \"$ex\" = no ] && would_spawn=yes; alive=no; if [ \"$would_spawn\" = yes ] && [ -n \"$sid\" ]; then for i in 1 2 3 4 5; do sleep 2; if pgrep -u \"$USER\" -f \"resume=$sid\" >/dev/null 2>&1; then alive=yes; break; fi; done; fi; echo \"$(date -Is) SessionEnd fired: reason=$reason cwd=$cwd sid=$sid vscode_active=$va in_claude_tmux=$ict existing=$ex would_spawn=$would_spawn alive_after_wait=$alive\" >> ~/.claude_hook.log; if [ \"$would_spawn\" = yes ] && [ \"$alive\" = no ]; then if [ -n \"$sid\" ]; then rc=\"claude --resume=$sid\"; else rc=\"claude --continue\"; fi; tmux new-session -d -s claude -c \"$cwd\" -e CLAUDE_AUTOCONTINUE=1 \"bash -lc '$rc'\" \\; set-option -t claude remain-on-exit on; echo \"$(date -Is) SessionEnd: spawned claude tmux session (cwd=$cwd sid=$sid)\" >> ~/.claude_hook.log; fi",
+    "command": "input=$(cat); reason=$(jq -r '.reason // \"other\"' <<<\"$input\"); cwd=$(jq -r '.cwd // empty' <<<\"$input\"); sid=$(jq -r '.session_id // empty' <<<\"$input\"); echo \"$input\" >> ~/.claude_hook_raw.jsonl; vscode_active() { pgrep -u \"$USER\" -f 'vscode-server/extensions/anthropic\\.claude-code-.*resources/native-binary/claude' >/dev/null 2>&1; }; in_claude_tmux() { [ -n \"$CLAUDE_AUTOCONTINUE\" ]; }; va=no; vscode_active && va=yes; ict=no; in_claude_tmux && ict=yes; wants=no; [ -n \"$cwd\" ] && [ \"$reason\" != \"clear\" ] && [ \"$reason\" != \"resume\" ] && [ \"$ict\" = no ] && wants=yes; alive=no; if [ \"$wants\" = yes ] && [ -n \"$sid\" ]; then for i in 1 2 3 4 5; do sleep 2; if pgrep -u \"$USER\" -f \"resume=$sid\" >/dev/null 2>&1; then alive=yes; break; fi; done; fi; would_spawn=no; [ \"$wants\" = yes ] && [ \"$alive\" = no ] && would_spawn=yes; ex=no; spawned=no; if [ \"$would_spawn\" = yes ]; then exec 9>~/.claude_autocontinue.lock; flock -x 9; tmux has-session -t claude 2>/dev/null && ex=yes; if [ \"$ex\" = no ]; then if [ -n \"$sid\" ]; then rc=\"claude --resume=$sid\"; else rc=\"claude --continue\"; fi; if tmux new-session -d -s claude -c \"$cwd\" -e CLAUDE_AUTOCONTINUE=1 \"bash -lc '$rc'\" \\; set-option -t claude remain-on-exit on; then spawned=yes; fi; fi; flock -u 9; else tmux has-session -t claude 2>/dev/null && ex=yes; fi; echo \"$(date -Is) SessionEnd fired: reason=$reason cwd=$cwd sid=$sid vscode_active=$va in_claude_tmux=$ict existing=$ex would_spawn=$would_spawn alive_after_wait=$alive spawned=$spawned\" >> ~/.claude_hook.log",
     "async": true,
     "timeout": 25
   }]
@@ -145,6 +145,30 @@ delay, with margin): correctly detected as alive partway through the
 retry window and skipped the spawn. A second test with a process that
 never appears confirmed it still spawns normally after exhausting all 5
 tries (~10s).
+
+**Locking around the actual spawn, fixing a second, separate race**: the
+liveness check above only answers "is *this* session still alive" — it
+doesn't protect against two *different* `SessionEnd` fires (for two
+different session_ids) racing each other for the single tmux session
+name `claude`. This is a real observed case, not hypothetical: during a
+live test, two `SessionEnd` fires for two completely different sessions
+landed in the same second, both saw `tmux has-session -t claude` return
+false (checked before either had created it), and both proceeded to spawn
+— but `tmux new-session` silently fails (exit code 1, "duplicate
+session") on a name that already exists, and the old code never checked
+that exit code, so it logged `spawned` regardless of whether the command
+actually succeeded. Evidence from that run indicated the *wrong* session
+won the race and the real one silently failed to get a background copy
+at all. Fixed by moving the existing-check-and-spawn into a critical
+section guarded by `flock` on `~/.claude_autocontinue.lock`, and by
+actually checking `tmux new-session`'s exit code (`spawned=yes` only on
+real success). The liveness-check retries happen *before* acquiring the
+lock (they're read-only and can take up to 10s; no reason to serialize
+those), only the final check-and-create step is locked. Tested directly
+by firing two `SessionEnd`s for two different fake session_ids
+concurrently: exactly one now spawns (`spawned=yes`), the other correctly
+detects the session already exists (`existing=yes, spawned=no`) instead
+of both racing.
 
 **`in_claude_tmux` no longer queries tmux live** — it used to be
 `[ -n "$TMUX" ] && [ "$(tmux display-message -p '#S')" = claude ]`, which
@@ -288,7 +312,7 @@ fact, whether this hook is what killed a session you expected to survive.
 - Check VSCode detection: `pgrep -u "$USER" -f 'vscode-server/extensions/anthropic\.claude-code-.*resources/native-binary/claude'`.
 - Check the auto-continue session: `tmux list-sessions | grep claude`, `tmux attach -t claude` to look inside without disturbing anything already running (detach with `Ctrl-b d` when done, not `exit`).
 - If a `claude` session keeps vanishing right after you expect it to start, check `~/.claude_hook.log` for a `SessionStart fired: ... killed=yes` line around that time — that's this cluster's actual observed failure mode: VSCode's disconnect can trigger a noisy flurry of `SessionStart`/`SessionEnd` cycles (likely reconnect attempts), and any `SessionStart` with `vscode_active=yes` kills the `claude` session unconditionally, including one that was just spawned moments earlier.
-- Check `~/.claude_hook.log`: every SessionEnd fire logs a `SessionEnd fired: reason=... cwd=... sid=... vscode_active=... in_claude_tmux=... existing=... would_spawn=... alive_after_wait=...` line unconditionally, plus a second `spawned` line if it actually spawned. If there's **no `fired` line at all** for a close you expected to trigger it, the hook never ran — check whether you're looking at `tmux ls` on a different login node than the one the hook ran on (the tmux socket is node-local, unlike `~/.claude_watching` or this log file, both under `$HOME`), or whether VSCode's close path for this session didn't invoke `SessionEnd` at all. If there's a `fired` line with `would_spawn=yes` but no `spawned` line, check `alive_after_wait`: `yes` means the liveness check correctly refused to resume a session that's still actually running (see "Known issue" below); if `alive_after_wait=no` and it still didn't spawn, something else is wrong and worth a fresh look. `~/.claude_hook_raw.jsonl` has the full unprocessed JSON payload for every fire, for whenever the extracted fields aren't enough.
+- Check `~/.claude_hook.log`: every SessionEnd fire logs one line — `SessionEnd fired: reason=... cwd=... sid=... vscode_active=... in_claude_tmux=... existing=... would_spawn=... alive_after_wait=... spawned=...` — with `spawned` reflecting `tmux new-session`'s actual exit code, not just whether the hook attempted it. If there's **no `fired` line at all** for a close you expected to trigger it, the hook never ran — check whether you're looking at `tmux ls` on a different login node than the one the hook ran on (the tmux socket is node-local, unlike `~/.claude_watching` or this log file, both under `$HOME`), or whether VSCode's close path for this session didn't invoke `SessionEnd` at all. If `would_spawn=yes` but `spawned=no`: `alive_after_wait=yes` means the liveness check correctly refused to resume a session that's still actually running (see "Known issue" below); `existing=yes` with `alive_after_wait=no` means it lost the lock race to a different, concurrent `SessionEnd` fire that spawned first (also see "Known issue") — both are working as intended, not bugs. `~/.claude_hook_raw.jsonl` has the full unprocessed JSON payload for every fire, for whenever the extracted fields aren't enough.
 - If a spawned session is present but shows a dead pane (`remain-on-exit` kept it around), `tmux attach -t claude` to read the error directly.
 - Ruled out (tested directly, not assumed): a detached tmux session surviving after its spawning context ends does **not** require `loginctl enable-linger` on this cluster — reproduced both a raw `SIGKILL` to the whole spawning process group and a full systemd user-scope teardown (`systemd-run --user --scope`), and the tmux session survived both, consistent with `KillUserProcesses` being off (`loginctl show-user $USER --property=Linger` showing `no` didn't matter in either reproduction). If a session still vanishes with no explanation from the checks above, it's more likely the race condition described above than a linger/systemd cleanup issue.
 - Bot token / chat ID live only in `~/.claude/settings.json` — rotate there if the bot token ever leaks.
@@ -368,3 +392,34 @@ a second time moments later; nothing in the design guaranteed that. Fixed
 by replacing the single 3-second-wait check with a retry loop (see hook
 (3) above) and confirmed via isolated tests that it now catches a process
 appearing partway through the window instead of missing it.
+
+**A live close/reopen test with the retry-loop fix in place surfaced a
+third, more serious real bug, since also fixed**: at the moment of
+closing, *two different* SessionEnd fires landed in the same second —
+one for this real conversation's session_id, and one for a completely
+different, still-unexplained session_id (consistent with the open
+question above: something produces SessionEnd fires for sessions other
+than the one closing, and this is further evidence of it, not an
+explanation). Both saw `tmux has-session -t claude` return false (checked
+before either had created it) and both tried to spawn — but `tmux
+new-session` on an already-existing name fails silently (confirmed
+directly: exit code 1, "duplicate session"), and the code at the time
+never checked that exit code, so it logged `spawned` for both regardless
+of whether either actually succeeded. Evidence from the follow-up log
+lines indicated the *other*, unrelated session won the race — meaning the
+real conversation's background copy silently failed to exist at all for
+the few minutes before VSCode was reopened, with nothing in the logs
+distinguishing that from success. Fixed with a `flock`-guarded critical
+section around the existing-check-and-spawn step (see hook (3) above),
+and by checking `tmux new-session`'s real exit code. Tested directly by
+firing two concurrent SessionEnds for two different fake session_ids:
+exactly one now spawns, the other correctly backs off.
+
+This third bug is arguably the most important one in this whole section:
+it's not a safety/collision issue like the first two (nothing was
+overwritten or corrupted), it's a silent **correctness** failure — the
+one thing this whole hook exists to do (keep *your* conversation going in
+the background) could fail with the log actively claiming it succeeded.
+Combined with the still-unexplained extra session_ids, it's a reminder
+that "no spawned=no in the log" was never sufficient evidence that the
+feature worked, until this fix.
