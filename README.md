@@ -2,12 +2,14 @@
 
 **Note**: during development, a still-actively-used VSCode session was
 observed briefly firing `SessionEnd` events repeatedly despite nothing
-actually ending — later traced to a since-fixed self-loop race in
-`in_claude_tmux`, triggered by manually killing the tmux session
-repeatedly while debugging it (confirmed: over an hour of subsequent
-normal use produced zero further such fires). A liveness check (hook (3)
-below) makes the spawn safe regardless either way. See "Known issue
-(resolved)" near the end of this file for the full account.
+actually ending. The cause isn't confirmed — one contributing factor
+(manually killing the tmux session while debugging a separate race) is
+plausible for that specific burst, but whether it correlates with
+messaging through the VSCode extension specifically is still an open,
+untested question (a "zero fires for an hour" check turned out to be
+invalid — see "Known issue" near the end of this file for why). A
+liveness check (hook (3) below) makes the spawn safe either way, without
+needing this resolved.
 
 Two things, wired together:
 1. Sends a Telegram message whenever a Claude Code CLI turn ends, so you get
@@ -277,7 +279,7 @@ fact, whether this hook is what killed a session you expected to survive.
 - Ruled out (tested directly, not assumed): a detached tmux session surviving after its spawning context ends does **not** require `loginctl enable-linger` on this cluster — reproduced both a raw `SIGKILL` to the whole spawning process group and a full systemd user-scope teardown (`systemd-run --user --scope`), and the tmux session survived both, consistent with `KillUserProcesses` being off (`loginctl show-user $USER --property=Linger` showing `no` didn't matter in either reproduction). If a session still vanishes with no explanation from the checks above, it's more likely the race condition described above than a linger/systemd cleanup issue.
 - Bot token / chat ID live only in `~/.claude/settings.json` — rotate there if the bot token ever leaks.
 
-## Known issue (resolved): a burst of repeated SessionEnd was self-inflicted by testing, not spontaneous
+## Known issue: repeated SessionEnd on a live session — cause still open, one theory retracted
 
 While testing the fixes above live, `~/.claude_hook.log` showed the
 *actual, currently open, actively-being-used* VSCode session firing
@@ -290,37 +292,40 @@ with the (then-still-broken) `in_claude_tmux` race, it was a real risk:
 each fire would have spawned a background tmux copy `--resume`-ing the
 *exact same, still-open* transcript concurrently with the real session.
 
-**Checked directly afterward, rather than left as an assumption**: from
-the end of that burst (19:57:37) through over an hour of continued normal
-use (dozens of messages, heavy tool-call activity, VSCode being closed and
-reopened at least once), `~/.claude_hook.log`'s own last-modified time
-never advanced past 19:57:37, and `~/.claude_hook_raw.jsonl` (which only
-gets written when SessionEnd actually fires) didn't exist at all a full
-hour later. Zero fires, despite the exact conditions (an active,
-message-heavy session) that supposedly triggered it repeatedly before.
-That rules out "fires on every message" and "fires on a fixed interval
-regardless of activity" — if either were true, that hour would have dozens
-of new log lines.
+**A follow-up check that turned out to be invalid, corrected here rather
+than left wrong**: after the burst ended (19:57:37), the following hour
+showed zero further fires, which was initially presented as ruling out
+"fires on every message" and "fires on a fixed interval." That check
+didn't actually control for interface: partway through that hour, the
+human side of this conversation switched from the VSCode extension to a
+manually-created tmux session running the CLI directly — and every
+message afterward, including the entire hour used for the "zero fires"
+check, went through that tmux session, not the VSCode extension. So the
+"zero fires" hour never actually tested whether messaging through the
+VSCode extension correlates with fires; it just showed that using the
+plain CLI directly doesn't produce them, which isn't the same claim and
+isn't surprising either way. **The "fires after every VSCode-extension
+message" hypothesis is therefore still open, not disproven.** A real test
+would require reconnecting through the VSCode extension specifically and
+watching `~/.claude_hook.log` while messaging that way.
 
-**The much more likely explanation**: the burst's timing lines up almost
-exactly with a window where `tmux kill-session -t claude` was being run
-repeatedly, by hand, while hunting down the `in_claude_tmux` race
-described above. Before that race was fixed, killing the session could
-cause its hosted `claude` process's own *genuine* SessionEnd to fire with
-the self-loop guard wrongly reading "not in tmux" (because the session
-was already gone), triggering an immediate respawn — which then got
-killed again, repeating the cycle. The different session_ids seen in the
-burst (`3128a7a7...`, `c6a64f1b...`) are consistent with those being the
-tmux-spawned copies' own session ids (from before the `--resume=$sid`
-fix, when spawns used plain `--continue`), each contributing its own
-SessionEnd when it was in turn killed or replaced. Once the manual
-kill/spawn cycle stopped (switching to isolated sandbox tests on a
-separate tmux socket, which never touch the real hooks), the firing
-stopped completely and hasn't recurred.
+**A separate, narrower observation that isn't affected by that mistake**:
+the original burst's timing lines up closely with a window where
+`tmux kill-session -t claude` was being run repeatedly, by hand, while
+hunting down the `in_claude_tmux` race described above. Before that race
+was fixed, killing the session could cause its hosted `claude` process's
+own *genuine* SessionEnd to fire with the self-loop guard wrongly reading
+"not in tmux" (because the session was already gone), triggering an
+immediate respawn — which then got killed again, repeating the cycle. The
+different session_ids seen in the burst (`3128a7a7...`, `c6a64f1b...`) are
+consistent with those being the tmux-spawned copies' own session ids
+(from before the `--resume=$sid` fix, when spawns used plain
+`--continue`), each contributing its own SessionEnd when it was in turn
+killed or replaced. This is a plausible *contributing* factor to that
+specific 15-minute burst — not proven, and not a claim about what causes
+`SessionEnd` to fire in general, which the VSCode-extension-message
+hypothesis above is still a live candidate for.
 
-This is not proven with the same rigor as the other fixes in this file
-(there's no controlled A/B test isolating the kill-session calls as the
-sole cause), but it's well-supported by the timing correlation and by the
-subsequent hour of silence under normal use. **The liveness check stays in
-place regardless** — it doesn't depend on this explanation being right,
-and costs nothing when SessionEnd behaves normally.
+**The liveness check stays in place regardless of which explanation (or
+combination) turns out to be right** — it doesn't depend on understanding
+the cause, and costs nothing when SessionEnd behaves normally.
