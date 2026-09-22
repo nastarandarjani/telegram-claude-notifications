@@ -1,15 +1,13 @@
 # Telegram notifications + auto-continue in tmux
 
-**⚠️ Known issue, mitigated but not root-caused**: a still-actively-used
-VSCode session was observed repeatedly emitting `SessionEnd` events
-(`reason=other`, its own real `session_id`) roughly every 20-70 seconds
-despite nothing actually ending. Left unmitigated, this would make the
-auto-continue spawn below resume the *exact same, still-live* session
-concurrently with the real one — two processes writing to the same
-transcript at once. The spawn now includes a liveness check (see hook (3)
-below) that closes this specific risk regardless of why the repeated
-firing happens, but the firing itself is still not understood. See "Known
-issue: repeated SessionEnd on a live session" near the end of this file.
+**Note**: during development, a still-actively-used VSCode session was
+observed briefly firing `SessionEnd` events repeatedly despite nothing
+actually ending — later traced to a since-fixed self-loop race in
+`in_claude_tmux`, triggered by manually killing the tmux session
+repeatedly while debugging it (confirmed: over an hour of subsequent
+normal use produced zero further such fires). A liveness check (hook (3)
+below) makes the spawn safe regardless either way. See "Known issue
+(resolved)" near the end of this file for the full account.
 
 Two things, wired together:
 1. Sends a Telegram message whenever a Claude Code CLI turn ends, so you get
@@ -279,55 +277,50 @@ fact, whether this hook is what killed a session you expected to survive.
 - Ruled out (tested directly, not assumed): a detached tmux session surviving after its spawning context ends does **not** require `loginctl enable-linger` on this cluster — reproduced both a raw `SIGKILL` to the whole spawning process group and a full systemd user-scope teardown (`systemd-run --user --scope`), and the tmux session survived both, consistent with `KillUserProcesses` being off (`loginctl show-user $USER --property=Linger` showing `no` didn't matter in either reproduction). If a session still vanishes with no explanation from the checks above, it's more likely the race condition described above than a linger/systemd cleanup issue.
 - Bot token / chat ID live only in `~/.claude/settings.json` — rotate there if the bot token ever leaks.
 
-## Known issue: repeated SessionEnd on a still-live session (mitigated, not root-caused)
+## Known issue (resolved): a burst of repeated SessionEnd was self-inflicted by testing, not spontaneous
 
 While testing the fixes above live, `~/.claude_hook.log` showed the
 *actual, currently open, actively-being-used* VSCode session firing
-`SessionEnd` (`reason=other`) with its own real `session_id` repeatedly —
-roughly every 20-70 seconds — despite the conversation obviously not
-having ended (it kept responding immediately after each fire). This is
-not the VSCode-reconnect-flapping pattern described elsewhere in this
-file (that involves distinguishable `SessionStart`/`SessionEnd` pairs from
-a session actually restarting); this was the *same* `session_id` firing
-`SessionEnd` over and over while clearly still alive.
+`SessionEnd` (`reason=other`) with its own real `session_id` repeatedly,
+in a roughly 15-minute window (19:43-19:57 in the original investigation),
+despite the conversation obviously not having ended. At the time this
+looked like it might be spontaneous — a periodic background behavior
+independent of anything happening in this environment — and, combined
+with the (then-still-broken) `in_claude_tmux` race, it was a real risk:
+each fire would have spawned a background tmux copy `--resume`-ing the
+*exact same, still-open* transcript concurrently with the real session.
 
-Before the liveness check existed, each of these fires would have spawned
-a background tmux copy that ran `--resume=<that same session_id>` — i.e.
-a second live process resuming the *exact* transcript the real, still-open
-session was using, concurrently. That's a real risk of two processes
-writing to the same conversation state at once, not just a wasted spawn.
-Caught directly by inspecting the process tree (`pstree`/`pgrep`) and
-finding two `claude` processes both tied to the same session id at the
-same time, followed by confirming via the log that the repeated fires
-shared that id.
+**Checked directly afterward, rather than left as an assumption**: from
+the end of that burst (19:57:37) through over an hour of continued normal
+use (dozens of messages, heavy tool-call activity, VSCode being closed and
+reopened at least once), `~/.claude_hook.log`'s own last-modified time
+never advanced past 19:57:37, and `~/.claude_hook_raw.jsonl` (which only
+gets written when SessionEnd actually fires) didn't exist at all a full
+hour later. Zero fires, despite the exact conditions (an active,
+message-heavy session) that supposedly triggered it repeatedly before.
+That rules out "fires on every message" and "fires on a fixed interval
+regardless of activity" — if either were true, that hour would have dozens
+of new log lines.
 
-The cause of the repeated `SessionEnd` firing itself is **still not
-understood**. It doesn't correlate with any tmux activity in this
-environment (killing/spawning tmux sessions was ruled out as the trigger:
-the fires continued at their own cadence independent of that), and other,
-*different* session_ids were also observed firing SessionEnd around the
-same times as the main session's own id — so this isn't specific to one
-misbehaving tab. Asked Claude Code's own documentation (via a
-`claude-code-guide` research pass) whether background prefetching, or any
-other internal mechanism, spawns auxiliary sessions with their own
-session_ids that would trigger these hooks, and whether the hook payload
-has any field to distinguish a main interactive session from an internal
-one: **the docs don't say**. Confirmed fields are `session_id`, `prompt_id`,
-`transcript_path`, `cwd`, `scratchpad_dir`, `permission_mode`,
-`hook_event_name`, plus `agent_id`/`agent_type` for subagents; the
-`reason` field's possible values and meanings (including what `other`
-covers) aren't documented at all, and there's no documented way to filter
-hooks to "real" top-level sessions only. This is a genuine documentation
-gap, not something resolvable from this side alone.
+**The much more likely explanation**: the burst's timing lines up almost
+exactly with a window where `tmux kill-session -t claude` was being run
+repeatedly, by hand, while hunting down the `in_claude_tmux` race
+described above. Before that race was fixed, killing the session could
+cause its hosted `claude` process's own *genuine* SessionEnd to fire with
+the self-loop guard wrongly reading "not in tmux" (because the session
+was already gone), triggering an immediate respawn — which then got
+killed again, repeating the cycle. The different session_ids seen in the
+burst (`3128a7a7...`, `c6a64f1b...`) are consistent with those being the
+tmux-spawned copies' own session ids (from before the `--resume=$sid`
+fix, when spawns used plain `--continue`), each contributing its own
+SessionEnd when it was in turn killed or replaced. Once the manual
+kill/spawn cycle stopped (switching to isolated sandbox tests on a
+separate tmux socket, which never touch the real hooks), the firing
+stopped completely and hasn't recurred.
 
-**Given the above, the mitigation in place is the actual fix, not a
-workaround pending a real one**: the liveness check (see hook (3) above)
-means the spawn's correctness no longer depends on understanding why
-`SessionEnd` fires — it only acts when the process table confirms the
-session is actually gone. The spawn is therefore re-enabled. If the
-repeated-firing cause is ever found (e.g. filing a `/feedback` request
-for the missing docs, or checking Claude Code's `--debug --debug-to-stderr`
-output), it would mostly matter for reducing log noise (`~/.claude_hook.log`
-and `~/.claude_hook_raw.jsonl` will keep accumulating `would_spawn=yes
-alive_after_wait=yes` entries for every spurious fire), not for closing a
-remaining safety gap.
+This is not proven with the same rigor as the other fixes in this file
+(there's no controlled A/B test isolating the kill-session calls as the
+sole cause), but it's well-supported by the timing correlation and by the
+subsequent hour of silence under normal use. **The liveness check stays in
+place regardless** — it doesn't depend on this explanation being right,
+and costs nothing when SessionEnd behaves normally.
