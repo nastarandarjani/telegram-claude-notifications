@@ -329,3 +329,26 @@ hypothesis above is still a live candidate for.
 **The liveness check stays in place regardless of which explanation (or
 combination) turns out to be right** — it doesn't depend on understanding
 the cause, and costs nothing when SessionEnd behaves normally.
+
+**A properly-controlled (if small) re-test was done**: reconnected through
+the VSCode extension specifically (confirmed via `TMUX` being unset and
+the live process's own argv), sent a couple of real messages over a
+~45-second window, and checked `~/.claude_hook.log` immediately after —
+zero fires. This is real evidence against "fires on every message,"
+unlike the earlier invalid hour-long check, but it's still a small sample
+(one ~45s window), so "fires periodically while VSCode is active, on no
+fixed short cadence" isn't ruled out by it. Considered sufficient for now
+by the person doing the testing; not escalated further.
+
+**A separate, real bug found during the reconnect part of this retest**:
+the moment VSCode reconnected, kill-on-open killed the pre-existing
+tmux-hosted copy of this same session, whose own shutdown fired a
+genuine SessionEnd for this session's real id. The liveness check waited
+3 seconds and found no live `--resume=<id>` process yet — because the
+*new* VSCode-side process hadn't finished starting up in that window —
+and incorrectly spawned a duplicate. It was cleaned up only because
+kill-on-open happened to fire a second time moments later; nothing in
+the design guarantees that. The 3-second, single-check liveness window
+is therefore not reliable specifically around a reconnect and should be
+made more robust (e.g. retrying over a longer window) before being fully
+trusted.
